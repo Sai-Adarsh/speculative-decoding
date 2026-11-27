@@ -63,14 +63,16 @@ bool local_server(std::string_view url) {
 
 } // namespace
 
-void llama_completion(std::string_view server, std::string_view prompt, std::size_t tokens) {
+void llama_completion(std::string_view server, std::string_view prompt, std::size_t tokens,
+                      bool ignore_eos) {
     if (!local_server(server)) {
         throw std::runtime_error("use a local llama-server URL such as http://127.0.0.1:8080");
     }
     const std::string url = std::string(server) + (server.ends_with('/') ? "completion" : "/completion");
     const std::string payload = "{\"prompt\":" + json_string(prompt)
         + ",\"n_predict\":" + std::to_string(tokens)
-        + ",\"seed\":2027,\"temperature\":0.7,\"cache_prompt\":false,\"stream\":false}";
+        + ",\"seed\":2027,\"temperature\":0.7,\"cache_prompt\":false,\"stream\":false,\"ignore_eos\":"
+        + (ignore_eos ? "true}" : "false}");
     const std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(curl_easy_init(), curl_easy_cleanup);
     const std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)> headers(
         curl_slist_append(nullptr, "Content-Type: application/json"), curl_slist_free_all);

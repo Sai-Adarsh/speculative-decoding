@@ -12,3 +12,19 @@ if(ENABLE_LLAMA_SERVER)
   target_link_libraries(speculative-decoding PRIVATE CURL::libcurl)
   target_compile_definitions(speculative-decoding PRIVATE ENABLE_LLAMA_SERVER)
 endif()
+
+include(CTest)
+if(BUILD_TESTING)
+  add_test(NAME speculative_fixture_cli
+    COMMAND "${CMAKE_COMMAND}"
+      "-DSPEC=$<TARGET_FILE:speculative-decoding>"
+      "-DSERVER_ENABLED=${ENABLE_LLAMA_SERVER}"
+      -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/fixture.cmake")
+  if(ENABLE_LLAMA_SERVER)
+    add_executable(speculative_loopback_test tests/loopback.cpp)
+    target_compile_features(speculative_loopback_test PRIVATE cxx_std_20)
+    add_test(NAME speculative_server_cli
+      COMMAND speculative_loopback_test "$<TARGET_FILE:speculative-decoding>")
+    set_tests_properties(speculative_server_cli PROPERTIES TIMEOUT 40)
+  endif()
+endif()
