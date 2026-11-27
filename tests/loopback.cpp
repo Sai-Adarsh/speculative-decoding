@@ -216,14 +216,14 @@ void paired(const std::string& executable, const Work& work, std::string_view fa
         const auto request = request_from(client.fd);
         if (!request.starts_with("POST /completion HTTP/")
             || request.find(R"("prompt":"paired prompt")") == std::string::npos
-            || request.find(R"("n_predict":64,"seed":2027,"temperature":0.7)") == std::string::npos
+            || request.find(R"("n_predict":64,"seed":2027,"temperature":0)") == std::string::npos
             || request.find(R"("cache_prompt":false,"stream":false,"ignore_eos":true)") == std::string::npos) {
             throw std::runtime_error("paired experiment settings differ");
         }
         send_response(client.fd, 200, body);
     };
-    const std::string base = R"({"timings":{"cache_n":-0,"prompt_n":4,"prompt_ms":3.0,"predicted_n":64,"predicted_ms":640.0,"predicted_per_second":100.0}})";
-    const std::string spec = R"({"timings":{"prompt_n":4,"prompt_ms":4.0,"predicted_n":64,"predicted_ms":320.0,"predicted_per_second":200.0,"draft_n":60,"draft_n_accepted":48}})";
+    const std::string base = R"({"content":"café","timings":{"cache_n":-0,"prompt_n":4,"prompt_ms":3.0,"predicted_n":64,"predicted_ms":640.0,"predicted_per_second":100.0}})";
+    const std::string spec = R"({"content":"caf\u00e9","timings":{"prompt_n":4,"prompt_ms":4.0,"predicted_n":64,"predicted_ms":320.0,"predicted_per_second":200.0,"draft_n":60,"draft_n_accepted":48}})";
     const auto replace = [](std::string body, std::string_view field, std::string_view replacement) {
         return body.replace(body.find(field), field.size(), replacement);
     };
@@ -258,6 +258,11 @@ void paired(const std::string& executable, const Work& work, std::string_view fa
         rejects("positive completion timing: predicted_per_second");
         return;
     }
+    if (fault == "no-content") {
+        reply(baseline, replace(base, R"("content":"café",)", ""));
+        rejects("no string content");
+        return;
+    }
     reply(baseline, base);
     if (fault == "no-drafts") {
         reply(speculative, base);
@@ -268,6 +273,11 @@ void paired(const std::string& executable, const Work& work, std::string_view fa
     if (fault == "warmup-prompt") {
         reply(speculative, mismatched);
         rejects("prompt token counts differ");
+        return;
+    }
+    if (fault == "warmup-content") {
+        reply(speculative, replace(spec, R"("content":"caf\u00e9")", R"("content":"cafe")"));
+        rejects("completion content differs in warmup");
         return;
     }
     reply(speculative, spec);
@@ -283,6 +293,12 @@ void paired(const std::string& executable, const Work& work, std::string_view fa
         return;
     }
     reply(speculative, spec);
+    if (fault == "different-content") {
+        reply(speculative, replace(spec, R"("content":"caf\u00e9")", R"("content":"cafe")"));
+        reply(baseline, base);
+        rejects("completion content differs in pair 2");
+        return;
+    }
     reply(speculative, spec);
     reply(baseline, base);
     if (child.finish() != 0) throw std::runtime_error(read(child.err));
@@ -305,8 +321,9 @@ int main(int argc, char** argv) try {
     scenario(argv[1], work, false, 503, R"({"error":"busy"})", "llama-server HTTP 503");
     scenario(argv[1], work, false, std::nullopt, "", "Empty reply");
     scenario(argv[1], work, false, 200, std::string(8 * 1024 * 1024 + 1, 'x'), "writing");
-    for (const auto* fault : {"", "short", "baseline-drafts", "no-drafts", "cached",
-                              "no-timings", "negative-count", "zero-rate", "warmup-prompt", "measured-prompt"}) {
+    for (const auto* fault : {"", "different-content", "short", "baseline-drafts", "no-drafts", "cached",
+                              "no-timings", "negative-count", "zero-rate", "no-content", "warmup-prompt",
+                              "warmup-content", "measured-prompt"}) {
         paired(argv[1], work, fault);
     }
     return 0;

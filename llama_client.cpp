@@ -74,15 +74,18 @@ struct Completion {
     double elapsed_ms;
 };
 
+enum class Sampling { stochastic, greedy };
+
 Completion request_completion(std::string_view server, std::string_view prompt, std::size_t tokens,
-                              bool ignore_eos) {
+                              bool ignore_eos, Sampling sampling) {
     if (local_port(server) == 0) {
         throw std::runtime_error("use a local llama-server URL such as http://127.0.0.1:8080");
     }
     const std::string url = std::string(server) + (server.ends_with('/') ? "completion" : "/completion");
     const std::string payload = "{\"prompt\":" + json_string(prompt)
         + ",\"n_predict\":" + std::to_string(tokens)
-        + ",\"seed\":2027,\"temperature\":0.7,\"cache_prompt\":false,\"stream\":false,\"ignore_eos\":"
+        + ",\"seed\":2027,\"temperature\":" + (sampling == Sampling::greedy ? "0" : "0.7")
+        + ",\"cache_prompt\":false,\"stream\":false,\"ignore_eos\":"
         + (ignore_eos ? "true}" : "false}");
     const std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(curl_easy_init(), curl_easy_cleanup);
     const std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)> headers(
@@ -125,6 +128,11 @@ struct Timings {
     std::uint64_t accepted;
 };
 
+struct Measurement {
+    Timings timings;
+    std::string content;
+};
+
 std::uint64_t count(const Json& timings, const char* key) {
     const auto value = timings.find(key);
     if (value != timings.end() && value->is_number_unsigned()) {
@@ -145,7 +153,7 @@ double positive_timing(const Json& timings, const char* key) {
     throw std::runtime_error(std::string("expected a positive completion timing: ") + key);
 }
 
-Timings read_timings(const Completion& response, std::size_t tokens, bool speculative) {
+Measurement read_measurement(const Completion& response, std::size_t tokens, bool speculative) {
     const auto payload = Json::parse(response.body, nullptr, false);
     const auto timings = payload.find("timings");
     if (timings == payload.end() || !timings->is_object()) {
@@ -165,16 +173,20 @@ Timings read_timings(const Completion& response, std::size_t tokens, bool specul
     if (speculative && (drafted == 0 || !timings->contains("draft_n_accepted") || accepted > drafted)) {
         throw std::runtime_error("speculative endpoint did not report valid draft activity");
     }
-    return {count(*timings, "prompt_n"), positive_timing(*timings, "prompt_ms"),
-            positive_timing(*timings, "predicted_ms"), positive_timing(*timings, "predicted_per_second"),
-            response.elapsed_ms, drafted, accepted};
+    const auto content = payload.find("content");
+    if (content == payload.end() || !content->is_string()) {
+        throw std::runtime_error("completion has no string content");
+    }
+    return {{count(*timings, "prompt_n"), positive_timing(*timings, "prompt_ms"),
+             positive_timing(*timings, "predicted_ms"), positive_timing(*timings, "predicted_per_second"),
+             response.elapsed_ms, drafted, accepted}, content->get<std::string>()};
 }
 
 } // namespace
 
 void llama_completion(std::string_view server, std::string_view prompt, std::size_t tokens,
                       bool ignore_eos) {
-    const auto completion = request_completion(server, prompt, tokens, ignore_eos);
+    const auto completion = request_completion(server, prompt, tokens, ignore_eos, Sampling::stochastic);
     std::cerr << "elapsed_ms=" << completion.elapsed_ms << '\n';
     std::cout << completion.body << '\n';
 }
@@ -186,20 +198,24 @@ void llama_compare(std::string_view baseline, std::string_view speculative, std:
         throw std::runtime_error("paired comparison requires two distinct loopback server ports");
     }
     const auto measure = [&](std::string_view server, bool with_draft) {
-        return read_timings(request_completion(server, prompt, tokens, true), tokens, with_draft);
+        return read_measurement(request_completion(server, prompt, tokens, true, Sampling::greedy),
+                                tokens, with_draft);
     };
     const auto baseline_warmup = measure(baseline, false);
     const auto speculative_warmup = measure(speculative, true);
-    const auto prompt_tokens = baseline_warmup.prompt_tokens;
-    if (prompt_tokens == 0 || speculative_warmup.prompt_tokens != prompt_tokens) {
+    const auto prompt_tokens = baseline_warmup.timings.prompt_tokens;
+    if (prompt_tokens == 0 || speculative_warmup.timings.prompt_tokens != prompt_tokens) {
         throw std::runtime_error("baseline and speculative prompt token counts differ or are empty");
+    }
+    if (baseline_warmup.content != speculative_warmup.content) {
+        throw std::runtime_error("completion content differs in warmup");
     }
 
     std::vector<std::pair<Timings, Timings>> results;
     results.reserve(pairs);
     for (std::size_t pair = 0; pair < pairs; ++pair) {
-        Timings base{};
-        Timings spec{};
+        Measurement base{};
+        Measurement spec{};
         if (pair % 2 == 0) {
             base = measure(baseline, false);
             spec = measure(speculative, true);
@@ -207,10 +223,13 @@ void llama_compare(std::string_view baseline, std::string_view speculative, std:
             spec = measure(speculative, true);
             base = measure(baseline, false);
         }
-        if (base.prompt_tokens != prompt_tokens || spec.prompt_tokens != prompt_tokens) {
+        if (base.timings.prompt_tokens != prompt_tokens || spec.timings.prompt_tokens != prompt_tokens) {
             throw std::runtime_error("prompt token counts changed after warmup");
         }
-        results.emplace_back(base, spec);
+        if (base.content != spec.content) {
+            throw std::runtime_error("completion content differs in pair " + std::to_string(pair + 1));
+        }
+        results.emplace_back(base.timings, spec.timings);
     }
 
     std::cout << "pair,first,prompt_tokens,generated_tokens,baseline_prompt_ms,speculative_prompt_ms,"

@@ -52,21 +52,21 @@ The server drafts and verifies tokens. The client saves completion timings and w
 
 ## Pair requests across two servers
 
-If both configurations fit concurrently, start the baseline and speculative servers on different loopback ports. Use corresponding hardware allocations and the same target checkpoint, context, and sampling settings. The client runs one warmup per server and alternates which server goes first in each measured pair. Each request uses the same prompt, sampling seed and token budget, switches off prompt caching, and suppresses EOS.
+If both configurations fit concurrently, start the baseline and speculative servers on different loopback ports. Use corresponding hardware allocations and the same target checkpoint and context. The client runs one warmup per server and alternates which server goes first in each measured pair. Each request uses greedy decoding at temperature 0, the same prompt and token budget, disabled prompt caching, and EOS suppression.
 
 ```sh
 ./build/speculative-decoding --compare http://127.0.0.1:8080 http://127.0.0.1:8081 \
   'Once upon a time, there was a little dog' 64 9 > paired.csv
 ```
 
-The CSV keeps every pair's prefill time, decode time and rate reported by llama.cpp, client completion time, and drafted and accepted token counts. Decode speedup is the speculative rate divided by the baseline rate for that pair. The client rejects mismatched token counts, reported prompt-cache reuse, baseline draft activity, and missing or invalid speculative counts. Check the server launch flags and checkpoint hashes separately when comparing hardware.
+The CSV keeps every pair's prefill time, decode time and rate reported by llama.cpp, client completion time, and drafted and accepted token counts. Decode speedup is the speculative rate divided by the baseline rate for that pair. In the warmup and every measured pair, the client requires the same decoded bytes in the response's JSON `content` string. It also rejects mismatched token counts, reported prompt-cache reuse, baseline draft activity, and missing or invalid speculative counts. Check the server launch flags and checkpoint hashes separately when comparing hardware.
 
-With the local TinyStories setup below, [nine alternating pairs](evidence/tinystories-paired-9.csv) had median server decode rates of 1,175.64 tok/s for the baseline and 963.79 tok/s for speculation. The median per-pair speedup was 0.826×, with 450 of 450 proposed tokens accepted. Both processes stayed resident on the same Apple M3 Pro while the client issued each request sequentially.
+With the local TinyStories setup below, [nine alternating greedy pairs](evidence/tinystories-paired-9.csv) passed the decoded content check. Median server decode rates were 1,215.63 tok/s for the baseline and 771.03 tok/s for speculation. The median per-pair speedup was 0.622×, with 441 of 477 proposed tokens accepted. Both processes stayed resident on the same Apple M3 Pro while the client issued each request sequentially.
 
 
 ## Measured local transformer pair
 
-The [seven recorded requests per mode](evidence/tinystories-loopback.csv) used llama.cpp `b12810` / `ca123ba76` on an Apple M3 Pro. The target was the F32 `stories15M.gguf` TinyStories checkpoint (24.4M total parameters as reported by llama.cpp). The draft was the same checkpoint calibrated to Q4_K_M, with the matching tokenizer. The [calibration project](https://github.com/Sai-Adarsh/fp4-calibration) records its input hashes and corpus recipe.
+The [seven recorded requests per mode](evidence/tinystories-loopback.csv) used the single-server command at temperature 0.7. They ran llama.cpp `b12810` / `ca123ba76` on an Apple M3 Pro. The target was the F32 `stories15M.gguf` TinyStories checkpoint (24.4M total parameters as reported by llama.cpp). The draft was the same checkpoint calibrated to Q4_K_M, with the matching tokenizer. The [calibration project](https://github.com/Sai-Adarsh/fp4-calibration) records its input hashes and corpus recipe.
 
 Both configurations used one slot, four threads, a 128-token context, and zero offloaded model layers. The speculative run used a four-token maximum draft and probabilistic verification. After one warmup, each configuration completed the same 11-token prompt and generated 64 tokens with EOS suppression.
 
@@ -97,7 +97,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-The fixture test checks token accounting, accepted and rejected proposals, and joint error across emitted sequences. Local HTTP fixtures check request escaping, EOS suppression, timing response passthrough, and response failures. The paired test verifies the order of requests and rejects shortened output or invalid draft activity before writing any CSV. The tests use no model downloads or external services.
+The fixture test checks token accounting, accepted and rejected proposals, and joint error across emitted sequences. Local HTTP fixtures check request escaping, EOS suppression, timing response passthrough, and response failures. The paired test verifies greedy sampling, request order, and content parity, including equivalent JSON encodings of the same text. Shortened or divergent output and invalid draft activity must fail without emitting CSV. The tests use no model downloads or external services.
 
 For merged line and branch coverage on macOS, exercise both build configurations:
 
@@ -118,4 +118,4 @@ xcrun llvm-cov report "$cov_dir/ON/speculative-decoding" \
   main.cpp llama_client.cpp
 ```
 
-The two builds covered 413 of 417 production lines (99.04%) and 193 of 212 branches (91.04%). The uncovered lines handle libcurl initialization and response-buffer allocation failures.
+The two builds covered 426 of 430 production lines (99.07%) and 204 of 224 branches (91.07%). The uncovered lines handle libcurl initialization and response-buffer allocation failures.
