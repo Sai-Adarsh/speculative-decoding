@@ -99,46 +99,86 @@ std::string read(const std::filesystem::path& path) {
     return {std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
 }
 
+struct Listener {
+    Fd socket{::socket(AF_INET, SOCK_STREAM, 0)};
+    std::string port;
+
+    Listener() {
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        if (bind(socket.fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0
+            || listen(socket.fd, 1) != 0) throw std::runtime_error("cannot bind localhost");
+        socklen_t length = sizeof(address);
+        if (getsockname(socket.fd, reinterpret_cast<sockaddr*>(&address), &length) != 0) {
+            throw std::runtime_error("cannot get localhost port");
+        }
+        // The child must not retain the listening socket.
+        if (fcntl(socket.fd, F_SETFD, FD_CLOEXEC) != 0) throw std::runtime_error("fcntl failed");
+        port = std::to_string(ntohs(address.sin_port));
+    }
+
+    Fd accept() const {
+        wait_readable(socket.fd);
+        return Fd(::accept(socket.fd, nullptr, nullptr));
+    }
+    std::string url() const { return "http://127.0.0.1:" + port; }
+};
+
+struct Child {
+    pid_t pid = -1;
+    const std::filesystem::path out;
+    const std::filesystem::path err;
+
+    Child(const Work& work, std::vector<std::string> args)
+        : out(work.path / "stdout"), err(work.path / "stderr") {
+        std::vector<char*> argv;
+        for (auto& arg : args) argv.push_back(arg.data());
+        argv.push_back(nullptr);
+        posix_spawn_file_actions_t actions;
+        int spawn = posix_spawn_file_actions_init(&actions);
+        if (spawn != 0) throw std::runtime_error("spawn actions failed");
+        spawn = posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, out.c_str(),
+                                               O_CREAT | O_WRONLY | O_TRUNC, 0600);
+        if (spawn == 0) {
+            spawn = posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, err.c_str(),
+                                                    O_CREAT | O_WRONLY | O_TRUNC, 0600);
+        }
+        if (spawn == 0) spawn = posix_spawn(&pid, argv.front(), &actions, nullptr, argv.data(), environ);
+        posix_spawn_file_actions_destroy(&actions);
+        if (spawn != 0) throw std::runtime_error("spawn client failed");
+    }
+
+    Child(const Child&) = delete;
+    Child& operator=(const Child&) = delete;
+
+    ~Child() {
+        if (pid == -1) return;
+        kill(pid, SIGKILL);
+        while (waitpid(pid, nullptr, 0) < 0 && errno == EINTR) {}
+    }
+
+    int finish() {
+        int result = 0;
+        while (waitpid(pid, &result, 0) < 0) {
+            if (errno != EINTR) throw std::runtime_error("waitpid failed");
+        }
+        pid = -1;
+        if (!WIFEXITED(result)) throw std::runtime_error("client exited abnormally");
+        return WEXITSTATUS(result);
+    }
+};
+
 void scenario(const std::string& executable, const Work& work, bool ignore_eos,
               std::optional<int> status, const std::string& body, std::string_view expected) {
-    Fd listener(socket(AF_INET, SOCK_STREAM, 0));
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (bind(listener.fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0
-        || listen(listener.fd, 1) != 0) throw std::runtime_error("cannot bind localhost");
-    socklen_t length = sizeof(address);
-    if (getsockname(listener.fd, reinterpret_cast<sockaddr*>(&address), &length) != 0) {
-        throw std::runtime_error("cannot get localhost port");
-    }
-    // The child must not retain the listening socket.
-    if (fcntl(listener.fd, F_SETFD, FD_CLOEXEC) != 0) throw std::runtime_error("fcntl failed");
-    const auto port = std::to_string(ntohs(address.sin_port));
-    const auto stdout_path = work.path / "stdout";
-    const auto stderr_path = work.path / "stderr";
+    Listener listener;
     std::vector<std::string> args{executable, "--server",
-        ignore_eos ? "http://localhost:" + port + "/" : "http://127.0.0.1:" + port,
+        ignore_eos ? "http://localhost:" + listener.port + "/" : listener.url(),
         "quote \" backslash \\ newline\n café", "64"};
     if (ignore_eos) args.emplace_back("--ignore-eos");
-    std::vector<char*> argv;
-    for (auto& arg : args) argv.push_back(arg.data());
-    argv.push_back(nullptr);
-    posix_spawn_file_actions_t actions;
-    int spawn = posix_spawn_file_actions_init(&actions);
-    if (spawn != 0) throw std::runtime_error("spawn actions failed");
-    spawn = posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, stdout_path.c_str(),
-                                           O_CREAT | O_WRONLY | O_TRUNC, 0600);
-    if (spawn == 0) {
-        spawn = posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, stderr_path.c_str(),
-                                                O_CREAT | O_WRONLY | O_TRUNC, 0600);
-    }
-    pid_t child = -1;
-    if (spawn == 0) spawn = posix_spawn(&child, executable.c_str(), &actions, nullptr, argv.data(), environ);
-    posix_spawn_file_actions_destroy(&actions);
-    if (spawn != 0) throw std::runtime_error("spawn client failed");
-    try {
-        wait_readable(listener.fd);
-        Fd client(accept(listener.fd, nullptr, nullptr));
+    Child child(work, std::move(args));
+    {
+        auto client = listener.accept();
         const auto request = request_from(client.fd);
         if (!request.starts_with("POST /completion HTTP/")
             || request.find(R"(quote \" backslash \\ newline\u000a café)") == std::string::npos
@@ -147,19 +187,12 @@ void scenario(const std::string& executable, const Work& work, bool ignore_eos,
             throw std::runtime_error("unexpected client request");
         }
         if (status) send_response(client.fd, *status, body);
-    } catch (...) {
-        kill(child, SIGKILL);
-        while (waitpid(child, nullptr, 0) < 0 && errno == EINTR) {}
-        throw;
     }
-    int result = 0;
-    while (waitpid(child, &result, 0) < 0) {
-        if (errno != EINTR) throw std::runtime_error("waitpid failed");
-    }
-    const auto stdout_text = read(stdout_path);
-    const auto stderr_text = read(stderr_path);
+    const auto result = child.finish();
+    const auto stdout_text = read(child.out);
+    const auto stderr_text = read(child.err);
     const bool success = status == 200 && body.size() <= 8 * 1024 * 1024;
-    if (!WIFEXITED(result) || WEXITSTATUS(result) != (success ? 0 : 1)) {
+    if (result != (success ? 0 : 1)) {
         throw std::runtime_error("unexpected client exit: " + stderr_text);
     }
     if (success && (stdout_text != body + '\n' || !stderr_text.starts_with("elapsed_ms="))) {
@@ -173,6 +206,94 @@ void scenario(const std::string& executable, const Work& work, bool ignore_eos,
         throw std::runtime_error("unexpected client failure: " + stderr_text);
     }
 }
+
+void paired(const std::string& executable, const Work& work, std::string_view fault) {
+    Listener baseline;
+    Listener speculative;
+    Child child(work, {executable, "--compare", baseline.url(), speculative.url(), "paired prompt", "64", "2"});
+    const auto reply = [](const Listener& listener, const std::string& body) {
+        auto client = listener.accept();
+        const auto request = request_from(client.fd);
+        if (!request.starts_with("POST /completion HTTP/")
+            || request.find(R"("prompt":"paired prompt")") == std::string::npos
+            || request.find(R"("n_predict":64,"seed":2027,"temperature":0.7)") == std::string::npos
+            || request.find(R"("cache_prompt":false,"stream":false,"ignore_eos":true)") == std::string::npos) {
+            throw std::runtime_error("paired experiment settings differ");
+        }
+        send_response(client.fd, 200, body);
+    };
+    const std::string base = R"({"timings":{"cache_n":-0,"prompt_n":4,"prompt_ms":3.0,"predicted_n":64,"predicted_ms":640.0,"predicted_per_second":100.0}})";
+    const std::string spec = R"({"timings":{"prompt_n":4,"prompt_ms":4.0,"predicted_n":64,"predicted_ms":320.0,"predicted_per_second":200.0,"draft_n":60,"draft_n_accepted":48}})";
+    const auto replace = [](std::string body, std::string_view field, std::string_view replacement) {
+        return body.replace(body.find(field), field.size(), replacement);
+    };
+    const auto rejects = [&](std::string_view message) {
+        if (child.finish() != 1 || !read(child.out).empty()
+            || read(child.err).find(message) == std::string::npos) {
+            throw std::runtime_error("invalid completion produced paired results: " + read(child.err));
+        }
+    };
+    if (fault == "baseline-drafts") {
+        reply(baseline, spec);
+        rejects("baseline endpoint reported draft activity");
+        return;
+    }
+    if (fault == "cached") {
+        reply(baseline, replace(base, R"("cache_n":-0)", R"("cache_n":1)"));
+        rejects("reused cached prompt tokens");
+        return;
+    }
+    if (fault == "no-timings") {
+        reply(baseline, R"({"content":"not a timings response"})");
+        rejects("no timings object");
+        return;
+    }
+    if (fault == "negative-count") {
+        reply(baseline, replace(base, R"("predicted_n":64)", R"("predicted_n":-1)"));
+        rejects("nonnegative completion count: predicted_n");
+        return;
+    }
+    if (fault == "zero-rate") {
+        reply(baseline, replace(base, R"("predicted_per_second":100.0)", R"("predicted_per_second":0)"));
+        rejects("positive completion timing: predicted_per_second");
+        return;
+    }
+    reply(baseline, base);
+    if (fault == "no-drafts") {
+        reply(speculative, base);
+        rejects("speculative endpoint did not report valid draft activity");
+        return;
+    }
+    const auto mismatched = replace(spec, R"("prompt_n":4)", R"("prompt_n":5)");
+    if (fault == "warmup-prompt") {
+        reply(speculative, mismatched);
+        rejects("prompt token counts differ");
+        return;
+    }
+    reply(speculative, spec);
+    reply(baseline, base);
+    if (fault == "measured-prompt") {
+        reply(speculative, mismatched);
+        rejects("prompt token counts changed after warmup");
+        return;
+    }
+    if (fault == "short") {
+        reply(speculative, replace(spec, R"("predicted_n":64)", R"("predicted_n":63)"));
+        rejects("requested token count");
+        return;
+    }
+    reply(speculative, spec);
+    reply(speculative, spec);
+    reply(baseline, base);
+    if (child.finish() != 0) throw std::runtime_error(read(child.err));
+    const auto csv = read(child.out);
+    if (!csv.starts_with("pair,first,prompt_tokens,generated_tokens,")
+        || csv.find("\n1,baseline,4,64,3,4,640,320,") == std::string::npos
+        || csv.find("\n2,speculative,4,64,3,4,640,320,") == std::string::npos
+        || csv.find(",100,200,2,60,48\n") == std::string::npos) {
+        throw std::runtime_error("unexpected paired results: " + csv);
+    }
+}
 } // namespace
 
 int main(int argc, char** argv) try {
@@ -184,6 +305,10 @@ int main(int argc, char** argv) try {
     scenario(argv[1], work, false, 503, R"({"error":"busy"})", "llama-server HTTP 503");
     scenario(argv[1], work, false, std::nullopt, "", "Empty reply");
     scenario(argv[1], work, false, 200, std::string(8 * 1024 * 1024 + 1, 'x'), "writing");
+    for (const auto* fault : {"", "short", "baseline-drafts", "no-drafts", "cached",
+                              "no-timings", "negative-count", "zero-rate", "warmup-prompt", "measured-prompt"}) {
+        paired(argv[1], work, fault);
+    }
     return 0;
 } catch (const std::exception& error) {
     std::cerr << error.what() << '\n';

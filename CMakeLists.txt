@@ -8,8 +8,17 @@ target_compile_options(speculative-decoding PRIVATE -Wall -Wextra -Wpedantic)
 option(ENABLE_LLAMA_SERVER "Build the optional llama.cpp HTTP client" OFF)
 if(ENABLE_LLAMA_SERVER)
   find_package(CURL REQUIRED)
+  find_package(nlohmann_json 3.12 CONFIG QUIET)
+  if(NOT nlohmann_json_FOUND)
+    include(FetchContent)
+    FetchContent_Declare(nlohmann_json
+      GIT_REPOSITORY https://github.com/nlohmann/json.git
+      GIT_TAG v3.12.0
+      GIT_SHALLOW TRUE)
+    FetchContent_MakeAvailable(nlohmann_json)
+  endif()
   target_sources(speculative-decoding PRIVATE llama_client.cpp)
-  target_link_libraries(speculative-decoding PRIVATE CURL::libcurl)
+  target_link_libraries(speculative-decoding PRIVATE CURL::libcurl nlohmann_json::nlohmann_json)
   target_compile_definitions(speculative-decoding PRIVATE ENABLE_LLAMA_SERVER)
 endif()
 
