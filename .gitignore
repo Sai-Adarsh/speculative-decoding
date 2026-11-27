@@ -1,0 +1,11 @@
+/build/
+/results/
+**/target/
+**/build/
+**/.DS_Store
+*.gguf
+*.safetensors
+*.ncu-rep
+.env
+**/build-mlx/
+**/results/
