@@ -75,3 +75,33 @@ The client emits full server JSON on stdout and end-to-end elapsed milliseconds 
 
 - F32 target: `61b50d457809a5194818fd22e6724b456cd7bb9a6264c52c8110684c53f3704a`
 - Q4_K_M draft: `38bf32ea3054a7badf42b0374b61442cfbf2c8c3d4f2d89568a903bd863e4828`
+
+## Tests and coverage
+
+```sh
+cmake -S . -B build -DENABLE_LLAMA_SERVER=ON -DBUILD_TESTING=ON
+cmake --build build
+ctest --test-dir build --output-on-failure
+```
+
+The fixture test checks token accounting, accepted and rejected proposals, and joint error across emitted sequences. The HTTP test uses a local fake server to check request escaping, EOS suppression, timing response passthrough, and failure handling for HTTP errors, empty replies, and oversized responses. Neither test downloads models or contacts an external service.
+
+For merged line and branch coverage on macOS, exercise both build configurations:
+
+```sh
+cov_dir=$(mktemp -d)
+mkdir "$cov_dir/raw"
+for enabled in ON OFF; do
+  cmake -S . -B "$cov_dir/$enabled" -DCMAKE_BUILD_TYPE=Debug \
+    -DENABLE_LLAMA_SERVER="$enabled" \
+    -DCMAKE_CXX_FLAGS="-fprofile-instr-generate -fcoverage-mapping" \
+    -DCMAKE_EXE_LINKER_FLAGS="-fprofile-instr-generate"
+  cmake --build "$cov_dir/$enabled"
+  LLVM_PROFILE_FILE="$cov_dir/raw/%m-%p.profraw" ctest --test-dir "$cov_dir/$enabled" --output-on-failure
+done
+xcrun llvm-profdata merge -sparse "$cov_dir"/raw/*.profraw -o "$cov_dir/merged.profdata"
+xcrun llvm-cov report "$cov_dir/ON/speculative-decoding" \
+  -object "$cov_dir/OFF/speculative-decoding" -instr-profile "$cov_dir/merged.profdata"
+```
+
+The two builds covered 306 of 310 production lines (98.71%) and 126 of 132 branches (95.45%). The uncovered lines handle libcurl initialization and response-buffer allocation failures.
