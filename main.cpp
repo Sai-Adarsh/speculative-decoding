@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <charconv>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <iomanip>
@@ -12,15 +13,20 @@
 #include <vector>
 
 #ifdef ENABLE_LLAMA_SERVER
-void llama_completion(std::string_view server, std::string_view prompt, std::size_t tokens);
+void llama_completion(std::string_view server, std::string_view prompt, std::size_t tokens,
+                      bool ignore_eos);
 #endif
 
 namespace {
 
 constexpr std::string_view vocabulary = "abcd";
+constexpr auto vocab_size = vocabulary.size();
+constexpr auto context_count = vocab_size * vocab_size;
+constexpr auto joint_count = context_count * vocab_size;
 using Token = std::size_t;
-using Distribution = std::array<double, vocabulary.size()>;
+using Distribution = std::array<double, vocab_size>;
 using Random = std::mt19937_64;
+using Clock = std::chrono::steady_clock;
 
 class FixtureModel {
 public:
@@ -40,7 +46,8 @@ public:
         return result;
     }
 
-    // Columns represent next-token distributions before each proposal and after the last one.
+    // This fixture evaluates one distribution at a time. A real transformer can
+    // obtain the same logical columns in one multi-position forward pass.
     std::vector<Distribution> verify(std::vector<Token> context,
                                      std::span<const Token> proposals) const {
         std::vector<Distribution> columns;
@@ -69,8 +76,24 @@ struct Proposal {
 struct Stats {
     std::size_t proposed = 0;
     std::size_t accepted = 0;
-    std::size_t target_passes = 0;
-    std::array<std::size_t, vocabulary.size()> token_histogram{};
+    std::size_t rejected = 0;
+    std::size_t target_requests = 0;
+    std::size_t target_positions = 0;
+    double elapsed_ms = 0;
+    std::array<std::size_t, joint_count> prefix_histogram{};
+    std::array<std::size_t, joint_count> history_histogram{};
+
+    void observe(std::span<const Token> sequence) {
+        std::size_t prefix = 0;
+        for (std::size_t i = 0; i < std::min<std::size_t>(3, sequence.size()); ++i) {
+            prefix = prefix * vocab_size + sequence[i];
+        }
+        ++prefix_histogram[prefix];
+        for (std::size_t i = 2; i < sequence.size(); ++i) {
+            const auto index = (sequence[i - 2] * vocab_size + sequence[i - 1]) * vocab_size + sequence[i];
+            ++history_histogram[index];
+        }
+    }
 };
 
 std::vector<Token> speculative(const FixtureModel& draft, const FixtureModel& target,
@@ -96,7 +119,8 @@ std::vector<Token> speculative(const FixtureModel& draft, const FixtureModel& ta
         }
 
         const auto target_columns = target.verify(output, draft_ids);
-        ++stats.target_passes;
+        ++stats.target_requests;
+        stats.target_positions += target_columns.size();
         stats.proposed += proposals.size();
         bool rejected = false;
         for (std::size_t i = 0; i < proposals.size(); ++i) {
@@ -114,6 +138,7 @@ std::vector<Token> speculative(const FixtureModel& draft, const FixtureModel& ta
                 residual[id] = std::max(0.0, p[id] - q[id]);
             }
             output.push_back(sample(residual, rng));
+            ++stats.rejected;
             rejected = true;
             break;
         }
@@ -131,7 +156,8 @@ std::vector<Token> autoregressive(const FixtureModel& target, std::size_t length
     output.reserve(length);
     while (output.size() < length) {
         output.push_back(sample(target.next(output), rng));
-        ++stats.target_passes;
+        ++stats.target_requests;
+        ++stats.target_positions;
     }
     return output;
 }
@@ -145,15 +171,55 @@ std::size_t positive(std::string_view input, std::size_t limit) {
     return result;
 }
 
-void print_stats(std::string_view mode, const Stats& stats, std::size_t total) {
-    std::cout << mode << ',' << stats.target_passes << ',' << stats.proposed << ',' << stats.accepted
-              << ',' << std::fixed << std::setprecision(4);
+double prefix_tv(const Stats& stats, const FixtureModel& target, std::size_t trials, std::size_t depth) {
+    std::size_t leaves = 1;
+    for (std::size_t i = 0; i < depth; ++i) leaves *= vocab_size;
+    double l1 = 0;
+    for (std::size_t leaf = 0; leaf < leaves; ++leaf) {
+        std::array<Token, 3> prefix{};
+        auto index = leaf;
+        for (std::size_t i = depth; i > 0; --i) {
+            prefix[i - 1] = index % vocab_size;
+            index /= vocab_size;
+        }
+        double expected = 1;
+        for (std::size_t i = 0; i < depth; ++i) {
+            expected *= target.next(std::span(prefix).first(i))[prefix[i]];
+        }
+        l1 += std::abs(static_cast<double>(stats.prefix_histogram[leaf]) / trials - expected);
+    }
+    return l1 / 2;
+}
+
+double conditional_tv(const Stats& stats, const FixtureModel& target, std::size_t windows) {
+    double l1 = 0;
+    for (std::size_t history = 0; history < context_count; ++history) {
+        const std::array<Token, 2> context{history / vocab_size, history % vocab_size};
+        const auto expected = target.next(context);
+        const auto offset = history * vocab_size;
+        std::size_t count = 0;
+        for (std::size_t t = 0; t < vocab_size; ++t) count += stats.history_histogram[offset + t];
+        for (std::size_t t = 0; t < vocab_size; ++t) {
+            l1 += std::abs(static_cast<double>(stats.history_histogram[offset + t]) - count * expected[t]);
+        }
+    }
+    return l1 / (2 * windows);
+}
+
+void print_stats(std::string_view mode, const Stats& stats, const FixtureModel& target,
+                 std::size_t trials, std::size_t length, std::size_t lookahead) {
+    const auto windows = trials * (length > 2 ? length - 2 : 0);
+    const auto depth = std::min<std::size_t>(3, length);
+    std::cout << mode << ',' << trials << ',' << length << ',' << lookahead << ','
+              << stats.target_requests << ',' << stats.target_positions << ',' << stats.proposed
+              << ',' << stats.accepted << ',' << stats.rejected << ',' << std::fixed << std::setprecision(6);
     if (stats.proposed > 0) {
         std::cout << static_cast<double>(stats.accepted) / static_cast<double>(stats.proposed);
     }
-    for (const auto count : stats.token_histogram) {
-        std::cout << ',' << static_cast<double>(count) / static_cast<double>(total);
-    }
+    std::cout << ',' << stats.elapsed_ms << ',';
+    if (stats.elapsed_ms > 0) std::cout << 1000.0 * trials * length / stats.elapsed_ms;
+    std::cout << ',' << depth << ',' << prefix_tv(stats, target, trials, depth) << ',' << windows << ',';
+    if (windows > 0) std::cout << conditional_tv(stats, target, windows);
     std::cout << '\n';
 }
 
@@ -163,10 +229,11 @@ int main(int argc, const char* const* argv) {
     try {
         if (argc > 1 && std::string_view(argv[1]) == "--server") {
 #ifdef ENABLE_LLAMA_SERVER
-            if (argc != 5) {
-                throw std::runtime_error("usage: speculative-decoding --server URL PROMPT TOKENS");
+            const bool ignore_eos = argc == 6 && std::string_view(argv[5]) == "--ignore-eos";
+            if (argc != 5 && !ignore_eos) {
+                throw std::runtime_error("usage: speculative-decoding --server URL PROMPT TOKENS [--ignore-eos]");
             }
-            llama_completion(argv[2], argv[3], positive(argv[4], 16'384));
+            llama_completion(argv[2], argv[3], positive(argv[4], 16'384), ignore_eos);
             return 0;
 #else
             throw std::runtime_error("rebuild with -DENABLE_LLAMA_SERVER=ON to use --server");
@@ -190,19 +257,33 @@ int main(int argc, const char* const* argv) {
         Stats baseline_stats;
         Stats speculative_stats;
 
+        const auto run = [](Stats& stats, const auto& decode) {
+            const auto start = Clock::now();
+            const auto sequence = decode();
+            stats.elapsed_ms += std::chrono::duration<double, std::milli>(Clock::now() - start).count();
+            stats.observe(sequence);
+        };
+        const auto run_baseline = [&] {
+            run(baseline_stats, [&] { return autoregressive(target, length, baseline_rng, baseline_stats); });
+        };
+        const auto run_speculative = [&] {
+            run(speculative_stats, [&] { return speculative(draft, target, length, lookahead, speculative_rng, speculative_stats); });
+        };
         for (std::size_t trial = 0; trial < trials; ++trial) {
-            for (const auto token : autoregressive(target, length, baseline_rng, baseline_stats)) {
-                ++baseline_stats.token_histogram[token];
-            }
-            for (const auto token : speculative(draft, target, length, lookahead, speculative_rng,
-                                                speculative_stats)) {
-                ++speculative_stats.token_histogram[token];
+            if (trial % 2 == 0) {
+                run_baseline();
+                run_speculative();
+            } else {
+                run_speculative();
+                run_baseline();
             }
         }
 
-        std::cout << "mode,target_calls,proposed,accepted,acceptance_rate,p_a,p_b,p_c,p_d\n";
-        print_stats("autoregressive_fixture", baseline_stats, trials * length);
-        print_stats("speculative_fixture", speculative_stats, trials * length);
+        std::cout << "mode,trials,tokens_per_trial,lookahead,target_requests,serial_target_positions,"
+                     "proposed,accepted,rejections,acceptance_rate,cpu_elapsed_ms,cpu_tokens_per_s,"
+                     "joint_prefix_depth,joint_prefix_tv,conditional_windows,conditional_tv\n";
+        print_stats("autoregressive_fixture", baseline_stats, target, trials, length, 0);
+        print_stats("speculative_fixture", speculative_stats, target, trials, length, lookahead);
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

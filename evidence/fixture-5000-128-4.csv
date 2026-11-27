@@ -1,0 +1,3 @@
+mode,trials,tokens_per_trial,lookahead,target_requests,serial_target_positions,proposed,accepted,rejections,acceptance_rate,cpu_elapsed_ms,cpu_tokens_per_s,joint_prefix_depth,joint_prefix_tv,conditional_windows,conditional_tv
+autoregressive_fixture,5000,128,0,640000,640000,0,0,0,,32.038032,19976258.217110,3,0.032313,630000,0.002633
+speculative_fixture,5000,128,4,164731,810775,646044,475269,64759,0.735660,68.467372,9347518.114176,3,0.032233,630000,0.001848
