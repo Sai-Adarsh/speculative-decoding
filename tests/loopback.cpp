@@ -217,7 +217,7 @@ void paired(const std::string& executable, const Work& work, std::string_view fa
         if (!request.starts_with("POST /completion HTTP/")
             || request.find(R"("prompt":"paired prompt")") == std::string::npos
             || request.find(R"("n_predict":64,"seed":2027,"temperature":0)") == std::string::npos
-            || request.find(R"("cache_prompt":false,"stream":false,"ignore_eos":true)") == std::string::npos) {
+            || request.find(R"("cache_prompt":false,"stream":false,"ignore_eos":true,"return_tokens":true)") == std::string::npos) {
             throw std::runtime_error("paired experiment settings differ");
         }
         send_response(client.fd, 200, body);
@@ -266,6 +266,16 @@ void paired(const std::string& executable, const Work& work, std::string_view fa
     if (fault == "no-content") {
         reply(baseline, replace(base, R"("content":"café",)", ""));
         rejects("no string content");
+        return;
+    }
+    if (fault == "missing-tokens") {
+        reply(baseline, replace(base, tokens, "[]"));
+        rejects("did not return the requested token IDs");
+        return;
+    }
+    if (fault == "invalid-token") {
+        reply(baseline, replace(base, "[100,", "[-1,"));
+        rejects("returned an invalid token ID");
         return;
     }
     reply(baseline, base);
@@ -334,7 +344,7 @@ int main(int argc, char** argv) try {
     scenario(argv[1], work, false, 200, std::string(8 * 1024 * 1024 + 1, 'x'), "writing");
     for (const auto* fault : {"", "different-content", "different-tokens", "short", "baseline-drafts", "no-drafts", "cached",
                               "no-timings", "negative-count", "zero-rate", "no-content", "warmup-prompt",
-                              "warmup-content", "measured-prompt"}) {
+                              "warmup-content", "measured-prompt", "missing-tokens", "invalid-token"}) {
         paired(argv[1], work, fault);
     }
     return 0;

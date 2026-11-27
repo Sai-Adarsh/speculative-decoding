@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -86,7 +87,8 @@ Completion request_completion(std::string_view server, std::string_view prompt, 
         + ",\"n_predict\":" + std::to_string(tokens)
         + ",\"seed\":2027,\"temperature\":" + (sampling == Sampling::greedy ? "0" : "0.7")
         + ",\"cache_prompt\":false,\"stream\":false,\"ignore_eos\":"
-        + (ignore_eos ? "true}" : "false}");
+        + (ignore_eos ? "true" : "false")
+        + (sampling == Sampling::greedy ? ",\"return_tokens\":true}" : "}");
     const std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> curl(curl_easy_init(), curl_easy_cleanup);
     const std::unique_ptr<curl_slist, decltype(&curl_slist_free_all)> headers(
         curl_slist_append(nullptr, "Content-Type: application/json"), curl_slist_free_all);
@@ -131,6 +133,7 @@ struct Timings {
 struct Measurement {
     Timings timings;
     std::string content;
+    std::vector<std::int32_t> token_ids;
 };
 
 std::uint64_t count(const Json& timings, const char* key) {
@@ -177,9 +180,21 @@ Measurement read_measurement(const Completion& response, std::size_t tokens, boo
     if (content == payload.end() || !content->is_string()) {
         throw std::runtime_error("completion has no string content");
     }
+    const auto ids = payload.find("tokens");
+    if (ids == payload.end() || !ids->is_array() || ids->size() != tokens) {
+        throw std::runtime_error("completion did not return the requested token IDs");
+    }
+    std::vector<std::int32_t> token_ids;
+    token_ids.reserve(tokens);
+    for (const auto& id : *ids) {
+        if (!id.is_number_integer() || id.get<std::uint64_t>() > std::numeric_limits<std::int32_t>::max()) {
+            throw std::runtime_error("completion returned an invalid token ID");
+        }
+        token_ids.push_back(id.get<std::int32_t>());
+    }
     return {{count(*timings, "prompt_n"), positive_timing(*timings, "prompt_ms"),
              positive_timing(*timings, "predicted_ms"), positive_timing(*timings, "predicted_per_second"),
-             response.elapsed_ms, drafted, accepted}, content->get<std::string>()};
+             response.elapsed_ms, drafted, accepted}, content->get<std::string>(), std::move(token_ids)};
 }
 
 } // namespace
@@ -210,6 +225,9 @@ void llama_compare(std::string_view baseline, std::string_view speculative, std:
     if (baseline_warmup.content != speculative_warmup.content) {
         throw std::runtime_error("completion content differs in warmup");
     }
+    if (baseline_warmup.token_ids != speculative_warmup.token_ids) {
+        throw std::runtime_error("completion token IDs differ in warmup");
+    }
 
     std::vector<std::pair<Timings, Timings>> results;
     results.reserve(pairs);
@@ -228,6 +246,9 @@ void llama_compare(std::string_view baseline, std::string_view speculative, std:
         }
         if (base.content != spec.content) {
             throw std::runtime_error("completion content differs in pair " + std::to_string(pair + 1));
+        }
+        if (base.token_ids != spec.token_ids) {
+            throw std::runtime_error("completion token IDs differ in pair " + std::to_string(pair + 1));
         }
         results.emplace_back(base.timings, spec.timings);
     }
