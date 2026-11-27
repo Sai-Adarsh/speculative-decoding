@@ -250,6 +250,14 @@ void llama_compare(std::string_view baseline, std::string_view speculative, std:
         if (base.token_ids != spec.token_ids) {
             throw std::runtime_error("completion token IDs differ in pair " + std::to_string(pair + 1));
         }
+        if (base.content != baseline_warmup.content) {
+            throw std::runtime_error("completion content changed from warmup in pair "
+                                     + std::to_string(pair + 1));
+        }
+        if (base.token_ids != baseline_warmup.token_ids) {
+            throw std::runtime_error("completion token IDs changed from warmup in pair "
+                                     + std::to_string(pair + 1));
+        }
         results.emplace_back(base.timings, spec.timings);
     }
 

@@ -233,9 +233,12 @@ void paired(const std::string& executable, const Work& work, std::string_view fa
         return body.replace(body.find(field), field.size(), replacement);
     };
     const auto rejects = [&](std::string_view message) {
-        if (child.finish() != 1 || !read(child.out).empty()
+        const int status = child.finish();
+        if (status != 1 || !read(child.out).empty()
             || read(child.err).find(message) == std::string::npos) {
-            throw std::runtime_error("invalid completion produced paired results: " + read(child.err));
+            throw std::runtime_error(std::string(fault) + ": expected " + std::string(message)
+                                     + "; exit status " + std::to_string(status) + "\n"
+                                     + read(child.err));
         }
     };
     if (fault == "baseline-drafts") {
@@ -320,6 +323,18 @@ void paired(const std::string& executable, const Work& work, std::string_view fa
         rejects("completion token IDs differ in pair 2");
         return;
     }
+    if (fault == "token-drift") {
+        reply(speculative, replace(spec, "[100,", "[101,"));
+        reply(baseline, replace(base, "[100,", "[101,"));
+        rejects("completion token IDs changed from warmup in pair 2");
+        return;
+    }
+    if (fault == "content-drift") {
+        reply(speculative, replace(spec, R"("content":"caf\u00e9")", R"("content":"cafe")"));
+        reply(baseline, replace(base, R"("content":"café")", R"("content":"cafe")"));
+        rejects("completion content changed from warmup in pair 2");
+        return;
+    }
     reply(speculative, spec);
     reply(baseline, base);
     if (child.finish() != 0) throw std::runtime_error(read(child.err));
@@ -342,7 +357,8 @@ int main(int argc, char** argv) try {
     scenario(argv[1], work, false, 503, R"({"error":"busy"})", "llama-server HTTP 503");
     scenario(argv[1], work, false, std::nullopt, "", "Empty reply");
     scenario(argv[1], work, false, 200, std::string(8 * 1024 * 1024 + 1, 'x'), "writing");
-    for (const auto* fault : {"", "different-content", "different-tokens", "short", "baseline-drafts", "no-drafts", "cached",
+    for (const auto* fault : {"", "different-content", "different-tokens", "token-drift", "content-drift",
+                              "short", "baseline-drafts", "no-drafts", "cached",
                               "no-timings", "negative-count", "zero-rate", "no-content", "warmup-prompt",
                               "warmup-content", "measured-prompt", "missing-tokens", "invalid-token"}) {
         paired(argv[1], work, fault);
