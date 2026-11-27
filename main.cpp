@@ -15,6 +15,8 @@
 #ifdef ENABLE_LLAMA_SERVER
 void llama_completion(std::string_view server, std::string_view prompt, std::size_t tokens,
                       bool ignore_eos);
+void llama_compare(std::string_view baseline, std::string_view speculative, std::string_view prompt,
+                   std::size_t tokens, std::size_t pairs);
 #endif
 
 namespace {
@@ -239,8 +241,23 @@ int main(int argc, const char* const* argv) {
             throw std::runtime_error("rebuild with -DENABLE_LLAMA_SERVER=ON to use --server");
 #endif
         }
+        if (argc > 1 && std::string_view(argv[1]) == "--compare") {
+#ifdef ENABLE_LLAMA_SERVER
+            if (argc != 7) {
+                throw std::runtime_error("usage: speculative-decoding --compare BASE_URL SPEC_URL PROMPT TOKENS PAIRS");
+            }
+            llama_compare(argv[2], argv[3], argv[4], positive(argv[5], 16'384), positive(argv[6], 500));
+            return 0;
+#else
+            throw std::runtime_error("rebuild with -DENABLE_LLAMA_SERVER=ON to use --compare");
+#endif
+        }
         if (argc > 4 || (argc > 1 && std::string_view(argv[1]) == "--help")) {
             std::cerr << "usage: speculative-decoding [trials=1000] [tokens=128] [lookahead=4]\n";
+#ifdef ENABLE_LLAMA_SERVER
+            std::cerr << "       speculative-decoding --server URL PROMPT TOKENS [--ignore-eos]\n"
+                         "       speculative-decoding --compare BASE_URL SPEC_URL PROMPT TOKENS PAIRS\n";
+#endif
             return argc > 4 ? 1 : 0;
         }
 

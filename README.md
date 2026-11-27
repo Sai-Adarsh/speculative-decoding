@@ -19,7 +19,7 @@ The evaluator enumerates the exact three-token prefix probabilities under the ta
 
 ## 2B draft and 70B target with llama.cpp
 
-The optional C++ HTTP client needs libcurl development files. Use a CUDA-enabled `llama-server` whose help includes `--spec-draft-sampling`. Set `TARGET_GGUF` to a 70B checkpoint and `DRAFT_GGUF` to a roughly 2B checkpoint with the same vocabulary and token ID mapping. Choose quantization and GPU layers to fit your hardware. [llama-server options](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
+The optional C++ HTTP client needs libcurl development files. CMake uses an installed nlohmann/json package or fetches version 3.12.0. Use a CUDA-enabled `llama-server` whose help includes `--spec-draft-sampling`. Set `TARGET_GGUF` to a 70B checkpoint and `DRAFT_GGUF` to a roughly 2B checkpoint with the same vocabulary and token ID mapping. Choose quantization and GPU layers to fit your hardware. [llama-server options](https://github.com/ggml-org/llama.cpp/blob/master/tools/server/README.md)
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_LLAMA_SERVER=ON
@@ -50,10 +50,23 @@ jq '.timings' baseline.json speculative.json
 
 The server drafts and verifies tokens. The client saves completion timings and writes end-to-end latency to stderr. Warm both configurations and repeat over several prompts. Record accepted proposals, generation tokens per second, prompt characteristics, and VRAM to assess speedup on your hardware.
 
+## Pair requests across two servers
+
+If both configurations fit concurrently, start the baseline and speculative servers on different loopback ports. Use corresponding hardware allocations and the same target checkpoint and context. The client runs one warmup per server and alternates which server goes first in each measured pair. Each request uses greedy decoding at temperature 0, the same prompt and token budget, disabled prompt caching, and EOS suppression.
+
+```sh
+./build/speculative-decoding --compare http://127.0.0.1:8080 http://127.0.0.1:8081 \
+  'Once upon a time, there was a little dog' 64 9 > paired.csv
+```
+
+The CSV keeps every pair's prefill time, decode time and rate reported by llama.cpp, client completion time, and drafted and accepted token counts. Decode speedup is the speculative rate divided by the baseline rate for that pair. The client requests `return_tokens` and requires both the raw generated token IDs and decoded text to match in the warmup and every measured pair. It rejects malformed or missing IDs, mismatched token counts, reported prompt-cache reuse, baseline draft activity, and missing or invalid speculative counts. Check the server launch flags and checkpoint hashes separately when comparing hardware.
+
+With the local TinyStories setup below, [nine alternating greedy pairs](evidence/tinystories-paired-9.csv) passed the decoded content check used at the time. These records predate the token-ID check. Median server decode rates were 1,215.63 tok/s for the baseline and 771.03 tok/s for speculation. The median per-pair speedup was 0.622×, with 441 of 477 proposed tokens accepted. Both processes stayed resident on the same Apple M3 Pro while the client issued each request sequentially.
+
 
 ## Measured local transformer pair
 
-The [seven recorded requests per mode](evidence/tinystories-loopback.csv) used llama.cpp `b12810` / `ca123ba76` on an Apple M3 Pro. The target was the F32 `stories15M.gguf` TinyStories checkpoint (24.4M total parameters as reported by llama.cpp). The draft was the same checkpoint calibrated to Q4_K_M, with the matching tokenizer. The [calibration project](https://github.com/Sai-Adarsh/fp4-calibration) records its input hashes and corpus recipe.
+The [seven recorded requests per mode](evidence/tinystories-loopback.csv) used the single-server command at temperature 0.7. They ran llama.cpp `b12810` / `ca123ba76` on an Apple M3 Pro. The target was the F32 `stories15M.gguf` TinyStories checkpoint (24.4M total parameters as reported by llama.cpp). The draft was the same checkpoint calibrated to Q4_K_M, with the matching tokenizer. The [calibration project](https://github.com/Sai-Adarsh/fp4-calibration) records its input hashes and corpus recipe.
 
 Both configurations used one slot, four threads, a 128-token context, and zero offloaded model layers. The speculative run used a four-token maximum draft and probabilistic verification. After one warmup, each configuration completed the same 11-token prompt and generated 64 tokens with EOS suppression.
 
@@ -84,7 +97,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-The fixture test checks token accounting, accepted and rejected proposals, and joint error across emitted sequences. The HTTP test uses a local fake server to check request escaping, EOS suppression, timing response passthrough, and failure handling for HTTP errors, empty replies, and oversized responses. Neither test downloads models or contacts an external service.
+The fixture test checks token accounting, accepted and rejected proposals, and joint error across emitted sequences. Local HTTP fixtures check request escaping, EOS suppression, timing response passthrough, and response failures. The paired test verifies greedy sampling, request order, equivalent JSON encodings of the same text, and token-ID parity. Shortened or divergent output, missing or malformed token IDs, and invalid draft activity must fail without emitting CSV. The tests use no model downloads or external services.
 
 For merged line and branch coverage on macOS, exercise both build configurations:
 
@@ -101,7 +114,8 @@ for enabled in ON OFF; do
 done
 xcrun llvm-profdata merge -sparse "$cov_dir"/raw/*.profraw -o "$cov_dir/merged.profdata"
 xcrun llvm-cov report "$cov_dir/ON/speculative-decoding" \
-  -object "$cov_dir/OFF/speculative-decoding" -instr-profile "$cov_dir/merged.profdata"
+  -object "$cov_dir/OFF/speculative-decoding" -instr-profile "$cov_dir/merged.profdata" \
+  main.cpp llama_client.cpp
 ```
 
-The two builds covered 306 of 310 production lines (98.71%) and 126 of 132 branches (95.45%). The uncovered lines handle libcurl initialization and response-buffer allocation failures.
+The two builds covered 426 of 430 production lines (99.07%) and 204 of 224 branches (91.07%). The uncovered lines handle libcurl initialization and response-buffer allocation failures.
