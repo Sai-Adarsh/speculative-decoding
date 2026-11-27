@@ -222,8 +222,13 @@ void paired(const std::string& executable, const Work& work, std::string_view fa
         }
         send_response(client.fd, 200, body);
     };
-    const std::string base = R"({"content":"café","timings":{"cache_n":-0,"prompt_n":4,"prompt_ms":3.0,"predicted_n":64,"predicted_ms":640.0,"predicted_per_second":100.0}})";
-    const std::string spec = R"({"content":"caf\u00e9","timings":{"prompt_n":4,"prompt_ms":4.0,"predicted_n":64,"predicted_ms":320.0,"predicted_per_second":200.0,"draft_n":60,"draft_n_accepted":48}})";
+    std::string tokens = "[100";
+    for (int i = 1; i < 64; ++i) tokens += ",100";
+    tokens += ']';
+    const std::string base = R"({"content":"café","tokens":)" + tokens +
+        R"(,"timings":{"cache_n":-0,"prompt_n":4,"prompt_ms":3.0,"predicted_n":64,"predicted_ms":640.0,"predicted_per_second":100.0}})";
+    const std::string spec = R"({"content":"caf\u00e9","tokens":)" + tokens +
+        R"(,"timings":{"prompt_n":4,"prompt_ms":4.0,"predicted_n":64,"predicted_ms":320.0,"predicted_per_second":200.0,"draft_n":60,"draft_n_accepted":48}})";
     const auto replace = [](std::string body, std::string_view field, std::string_view replacement) {
         return body.replace(body.find(field), field.size(), replacement);
     };
@@ -299,6 +304,12 @@ void paired(const std::string& executable, const Work& work, std::string_view fa
         rejects("completion content differs in pair 2");
         return;
     }
+    if (fault == "different-tokens") {
+        reply(speculative, replace(spec, "[100,", "[101,"));
+        reply(baseline, base);
+        rejects("completion token IDs differ in pair 2");
+        return;
+    }
     reply(speculative, spec);
     reply(baseline, base);
     if (child.finish() != 0) throw std::runtime_error(read(child.err));
@@ -321,7 +332,7 @@ int main(int argc, char** argv) try {
     scenario(argv[1], work, false, 503, R"({"error":"busy"})", "llama-server HTTP 503");
     scenario(argv[1], work, false, std::nullopt, "", "Empty reply");
     scenario(argv[1], work, false, 200, std::string(8 * 1024 * 1024 + 1, 'x'), "writing");
-    for (const auto* fault : {"", "different-content", "short", "baseline-drafts", "no-drafts", "cached",
+    for (const auto* fault : {"", "different-content", "different-tokens", "short", "baseline-drafts", "no-drafts", "cached",
                               "no-timings", "negative-count", "zero-rate", "no-content", "warmup-prompt",
                               "warmup-content", "measured-prompt"}) {
         paired(argv[1], work, fault);
