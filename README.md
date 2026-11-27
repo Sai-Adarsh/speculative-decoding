@@ -59,7 +59,7 @@ If both configurations fit concurrently, start the baseline and speculative serv
   'Once upon a time, there was a little dog' 64 9 > paired.csv
 ```
 
-The CSV keeps every pair's prefill time, decode time and rate reported by llama.cpp, client completion time, and drafted and accepted token counts. Decode speedup is the speculative rate divided by the baseline rate for that pair. The client requests `return_tokens` and requires both the raw generated token IDs and decoded text to match in the warmup and every measured pair. It rejects malformed or missing IDs, mismatched token counts, reported prompt-cache reuse, baseline draft activity, and missing or invalid speculative counts. Check the server launch flags and checkpoint hashes separately when comparing hardware.
+The CSV keeps every pair's prefill time, decode time and rate reported by llama.cpp, client completion time, and drafted and accepted token counts. Decode speedup is the speculative rate divided by the baseline rate for that pair. The client requests `return_tokens` and requires both endpoints to return the same raw generated token IDs and decoded text on every request, starting with warmup. If either changes after warmup, the run fails without emitting CSV. It also rejects malformed or missing IDs, mismatched token counts, reported prompt-cache reuse, baseline draft activity, and missing or invalid speculative counts. Check the server launch flags and checkpoint hashes separately when comparing hardware.
 
 With the local TinyStories setup below, [nine alternating greedy pairs](evidence/tinystories-paired-9.csv) passed the decoded content check used at the time. These records predate the token-ID check. Median server decode rates were 1,215.63 tok/s for the baseline and 771.03 tok/s for speculation. The median per-pair speedup was 0.622×, with 441 of 477 proposed tokens accepted. Both processes stayed resident on the same Apple M3 Pro while the client issued each request sequentially.
 
@@ -97,7 +97,7 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
-The fixture test checks token accounting, accepted and rejected proposals, and joint error across emitted sequences. Local HTTP fixtures check request escaping, EOS suppression, timing response passthrough, and response failures. The paired test verifies greedy sampling, request order, equivalent JSON encodings of the same text, and token-ID parity. Shortened or divergent output, missing or malformed token IDs, and invalid draft activity must fail without emitting CSV. The tests use no model downloads or external services.
+The fixture test checks token accounting, accepted and rejected proposals, and joint error across emitted sequences. Local HTTP fixtures check request escaping, EOS suppression, timing response passthrough, and response failures. The paired test verifies greedy sampling, request order, equivalent JSON encodings of the same text, and token-ID parity. Shortened or divergent output, shared changes to text or token IDs after warmup, missing or malformed token IDs, and invalid draft activity must fail without emitting CSV. The tests use no model downloads or external services.
 
 For merged line and branch coverage on macOS, exercise both build configurations:
 
